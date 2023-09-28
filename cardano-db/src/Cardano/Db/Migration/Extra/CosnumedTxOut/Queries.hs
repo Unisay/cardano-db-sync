@@ -21,8 +21,10 @@ import Control.Monad.Trans.Reader (ReaderT)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+
+-- import Database.Esqueleto.Experimental hiding (update, (<=.), (=.), (==.))
 import Database.Esqueleto.Experimental hiding (update, (<=.), (=.), (==.))
-import qualified Database.Esqueleto.Experimental as Experimental
+import qualified Database.Esqueleto.Experimental as E
 import Database.Persist ((<=.), (=.), (==.))
 import Database.Persist.Class (update)
 import Database.Persist.Sql (deleteWhereCount)
@@ -231,9 +233,9 @@ deleteAndUpdateConsumedTxOut ::
 deleteAndUpdateConsumedTxOut trce blockNoDiff = do
   maxTxInId <- findMaxTxInId blockNoDiff
   case maxTxInId of
-    Left _ -> do
-      createConsumedTxOut
-      liftIO $ logInfo trce "Created ConsumedTxOut as there were no blocks present"
+    Left errMsg -> do
+      migrateTxOut (Just trce)
+      liftIO $ logInfo trce $ "No tx_out was deleted: " <> errMsg
     Right mxtxid -> do
       migrateNextPage mxtxid False 0
   where
@@ -255,8 +257,8 @@ splitAndProcessPageEntries ::
   TxInId ->
   [(TxInId, TxId, Word64)] ->
   ReaderT SqlBackend m Bool
-splitAndProcessPageEntries trce ranCreateConsumedTxOut maxTxInId entries = do
-  let entriesSplit = span (\(txInId, _, _) -> txInId <= maxTxInId) entries
+splitAndProcessPageEntries trce ranCreateConsumedTxOut maxTxInId pageEntries = do
+  let entriesSplit = span (\(txInId, _, _) -> txInId <= maxTxInId) pageEntries
   case entriesSplit of
     -- empty lists just return
     ([], []) -> pure True
@@ -276,14 +278,34 @@ splitAndProcessPageEntries trce ranCreateConsumedTxOut maxTxInId entries = do
       updateEntries ys
       pure True
   where
-    -- the delete + update can happen as one query
-    deleteEntries = mapM_ (\(_, txId, index) -> deleteTxOutConsumed txId index)
+    deleteEntries = deletePageEntries
+    -- this is deleting one entry at a time to check in benchmarking
+    -- deleteEntries = mapM_ (\(_, txId, index) -> deleteTxOutConsumed txId index)
     updateEntries = mapM_ (\(txInId, txId, index) -> updateTxOutConsumedByTxInIdUnique txId index txInId)
 
     shouldCreateConsumedTxOut rcc =
       unless rcc $ do
         liftIO $ logInfo trce "Created ConsumedTxOut when handling page entries."
         createConsumedTxOut
+
+-- this builds up a single delete query using the pageEntries list
+deletePageEntries ::
+  MonadIO m =>
+  [(TxInId, TxId, Word64)] ->
+  ReaderT SqlBackend m ()
+deletePageEntries transactionEntries = do
+  delete $ do
+    txOut <- from $ table @TxOut
+    where_
+      ( foldl1
+          (||.)
+          ( map
+              ( \(_, txId, index) ->
+                  txOut E.^. TxOutTxId E.==. val txId E.&&. txOut E.^. TxOutIndex E.==. val index
+              )
+              transactionEntries
+          )
+      )
 
 deleteTxOutConsumed :: MonadIO m => TxId -> Word64 -> ReaderT SqlBackend m ()
 deleteTxOutConsumed txOutId index =
@@ -335,6 +357,6 @@ queryBlockNo :: MonadIO m => Word64 -> ReaderT SqlBackend m (Maybe BlockId)
 queryBlockNo blkNo = do
   res <- select $ do
     blk <- from $ table @Block
-    where_ (blk ^. BlockBlockNo Experimental.==. just (val blkNo))
+    where_ (blk ^. BlockBlockNo E.==. just (val blkNo))
     pure (blk ^. BlockId)
   pure $ fmap unValue (listToMaybe res)
