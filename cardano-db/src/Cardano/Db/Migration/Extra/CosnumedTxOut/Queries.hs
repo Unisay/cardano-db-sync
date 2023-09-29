@@ -234,21 +234,34 @@ deleteAndUpdateConsumedTxOut trce blockNoDiff = do
   maxTxInId <- findMaxTxInId blockNoDiff
   case maxTxInId of
     Left errMsg -> do
-      migrateTxOut (Just trce)
       liftIO $ logInfo trce $ "No tx_out was deleted: " <> errMsg
-    Right mxtxid -> do
-      migrateNextPage mxtxid False 0
+      migrateNextPage Nothing False 0
+    Right mTxIdIn ->
+      migrateNextPage (Just mTxIdIn) False 0
   where
-    migrateNextPage :: TxInId -> Bool -> Word64 -> ReaderT SqlBackend m ()
-    migrateNextPage mxTxInId ranCreateConsumedTxOut offst = do
-      pageEntries <- getInputPage offst pageSize
-      resPageEntries <- splitAndProcessPageEntries trce ranCreateConsumedTxOut mxTxInId pageEntries
-      when (fromIntegral (length pageEntries) == pageSize) $
-        migrateNextPage mxTxInId resPageEntries $!
-          offst
-            + pageSize
+    migrateNextPage :: Maybe TxInId -> Bool -> Word64 -> ReaderT SqlBackend m ()
+    migrateNextPage maxTxInId ranCreateConsumedTxOut offst = do
+      case maxTxInId of
+        -- If there is no maxTxInId then don't need to deleteEntries so on first itteration we createConsumedTxOut.
+        -- Then we itterate over the rest of the pages entries in chunks of `pageSize`.
+        Nothing -> do
+          shouldCreateConsumedTxOut trce ranCreateConsumedTxOut
+          pageEntries <- getInputPage offst pageSize
+          updatePageEntries pageEntries
+          when (fromIntegral (length pageEntries) == pageSize) $
+            migrateNextPage Nothing True $!
+              offst
+                + pageSize
+        -- we do have a maxTxInId which allows us to delete then update and iterating using `pageSize`
+        Just mxTxInId -> do
+          pageEntries <- getInputPage offst pageSize
+          resPageEntries <- splitAndProcessPageEntries trce ranCreateConsumedTxOut mxTxInId pageEntries
+          when (fromIntegral (length pageEntries) == pageSize) $
+            migrateNextPage (Just mxTxInId) resPageEntries $!
+              offst
+                + pageSize
 
--- Split the page entries by maxTxInId and proces
+-- Split the page entries by maxTxInId and process
 splitAndProcessPageEntries ::
   forall m.
   (MonadIO m, MonadBaseControl IO m) =>
@@ -268,25 +281,36 @@ splitAndProcessPageEntries trce ranCreateConsumedTxOut maxTxInId pageEntries = d
       pure False
     -- the whole list is greater that maxTxInId
     ([], ys) -> do
-      shouldCreateConsumedTxOut ranCreateConsumedTxOut
+      shouldCreateConsumedTxOut trce ranCreateConsumedTxOut
       updateEntries ys
       pure True
     -- the list has both bellow and above maxTxInId
     (xs, ys) -> do
       deleteEntries xs
-      shouldCreateConsumedTxOut ranCreateConsumedTxOut
+      shouldCreateConsumedTxOut trce ranCreateConsumedTxOut
       updateEntries ys
       pure True
   where
     deleteEntries = deletePageEntries
     -- this is deleting one entry at a time to check in benchmarking
     -- deleteEntries = mapM_ (\(_, txId, index) -> deleteTxOutConsumed txId index)
-    updateEntries = mapM_ (\(txInId, txId, index) -> updateTxOutConsumedByTxInIdUnique txId index txInId)
+    updateEntries = updatePageEntries
 
-    shouldCreateConsumedTxOut rcc =
-      unless rcc $ do
-        liftIO $ logInfo trce "Created ConsumedTxOut when handling page entries."
-        createConsumedTxOut
+shouldCreateConsumedTxOut ::
+  (MonadIO m, MonadBaseControl IO m) =>
+  Trace IO Text ->
+  Bool ->
+  ReaderT SqlBackend m ()
+shouldCreateConsumedTxOut trce rcc =
+  unless rcc $ do
+    liftIO $ logInfo trce "Created ConsumedTxOut when handling page entries."
+    createConsumedTxOut
+
+updatePageEntries ::
+  MonadIO m =>
+  [(TxInId, TxId, Word64)] ->
+  ReaderT SqlBackend m ()
+updatePageEntries = mapM_ (\(txInId, txId, index) -> updateTxOutConsumedByTxInIdUnique txId index txInId)
 
 -- this builds up a single delete query using the pageEntries list
 deletePageEntries ::
